@@ -886,7 +886,16 @@ class SubprocessCLITransport(Transport):
 
             # Setup stderr stream if piped
             if stderr_dest is PIPE and self._process.stderr:
-                self._stderr_stream = TextReceiveStream(self._process.stderr)
+                # stderr is a diagnostic channel: the CLI's own crash output
+                # is exactly what a caller needs when the process dies. The
+                # TextReceiveStream default (errors="strict") turns a single
+                # invalid UTF-8 byte into a UnicodeDecodeError that ends the
+                # read loop, silently dropping every later line for the rest
+                # of the session. Replace undecodable bytes instead. stdout
+                # stays strict: its NDJSON must parse or fail loudly.
+                self._stderr_stream = TextReceiveStream(
+                    self._process.stderr, errors="replace"
+                )
                 # Spawn the stderr reader via spawn_detached (not a manually-
                 # entered TaskGroup) so cleanup has no trio task-affinity —
                 # same pattern as Query._read_task.
@@ -949,7 +958,7 @@ class SubprocessCLITransport(Transport):
         except anyio.ClosedResourceError:
             pass  # Stream closed, exit normally
         except Exception:
-            logger.debug("stderr stream read failed", exc_info=True)
+            logger.warning("stderr stream read failed", exc_info=True)
         finally:
             # In a `finally` so the last partial line still reaches the callback
             # when close() cancels this task: cancellation arrives as a
