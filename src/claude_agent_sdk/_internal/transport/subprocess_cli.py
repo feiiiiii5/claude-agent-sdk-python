@@ -886,7 +886,10 @@ class SubprocessCLITransport(Transport):
 
             # Setup stderr stream if piped
             if stderr_dest is PIPE and self._process.stderr:
-                self._stderr_stream = TextReceiveStream(self._process.stderr)
+                # Replace invalid stderr bytes so later diagnostics reach callbacks.
+                self._stderr_stream = TextReceiveStream(
+                    self._process.stderr, errors="replace"
+                )
                 # Spawn the stderr reader via spawn_detached (not a manually-
                 # entered TaskGroup) so cleanup has no trio task-affinity —
                 # same pattern as Query._read_task.

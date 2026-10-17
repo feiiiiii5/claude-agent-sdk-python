@@ -2575,6 +2575,71 @@ class TestSubprocessCLITransport:
 
         anyio.run(_test)
 
+    @pytest.mark.parametrize("backend", ["asyncio", "trio"])
+    def test_stderr_stream_survives_invalid_utf8(self, backend: str) -> None:
+        """Exercise connect()'s real decoder and preserve later stderr callbacks."""
+
+        async def _test() -> None:
+            received: list[str] = []
+
+            # Feed the fake process's stderr through an in-memory byte
+            # stream, an undecodable chunk sandwiched between two lines.
+            err_send, err_recv = anyio.create_memory_object_stream[bytes](10)
+            for chunk in (b"first\n", b"\xff\xfe not utf-8\n", b"third\n"):
+                err_send.send_nowait(chunk)
+            err_send.close()
+
+            class _FakeProcess:
+                def __init__(self) -> None:
+                    self.stdout = None
+                    self.stderr = err_recv
+                    self.stdin = None
+                    self.returncode = None
+
+                async def wait(self) -> int | None:
+                    return self.returncode
+
+                def terminate(self) -> None:
+                    self.returncode = -15
+
+                def kill(self) -> None:
+                    self.returncode = -9
+
+            process = _FakeProcess()
+
+            async def fake_open_process(
+                *args: object, **kwargs: object
+            ) -> _FakeProcess:
+                return process
+
+            transport = SubprocessCLITransport(
+                prompt="x", options=make_options(stderr=received.append)
+            )
+
+            try:
+                with (
+                    patch.dict(
+                        os.environ, {"CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": "1"}
+                    ),
+                    patch("anyio.open_process", new=fake_open_process),
+                ):
+                    await transport.connect()
+                    assert transport._stderr_task is not None
+                    await transport._stderr_task.wait()
+            finally:
+                # Assertions below can fail; keep the global child set
+                # clean either way.
+                process.returncode = 0
+                await transport.close()
+
+            # Both good lines must arrive, and the invalid bytes must come
+            # through as U+FFFD replacements rather than killing the loop.
+            assert received[0] == "first"
+            assert received[-1] == "third", received
+            assert "not utf-8" in received[1] and "\ufffd" in received[1]
+
+        anyio.run(_test, backend=backend)
+
 
 class TestAtexitChildCleanup:
     """Tests for the atexit handler that terminates orphaned CLI subprocesses."""
