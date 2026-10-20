@@ -9,7 +9,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from claude_agent_sdk import (
+    ClaudeSDKError,
     InMemorySessionStore,
+    SessionImportError,
     import_session_to_store,
     project_key_for_directory,
 )
@@ -127,6 +129,76 @@ class TestMainTranscript:
         assert spy.await_count == 1
         key: SessionKey = {"project_key": project_key, "session_id": SESSION_ID}
         assert store.get_entries(key) == entries
+
+
+# ---------------------------------------------------------------------------
+# Corrupt transcripts
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptTranscript:
+    @pytest.mark.anyio
+    async def test_corrupt_line_raises_before_anything_is_appended(
+        self, claude_dir: Path, cwd: Path, project_key: str
+    ) -> None:
+        """A truncated final line (writer killed mid-append) must not leave a
+        partial import behind (previously a bare JSONDecodeError escaped after
+        earlier batches had been flushed)."""
+        path = claude_dir / f"{SESSION_ID}.jsonl"
+        lines = [json.dumps(_entry(i)) for i in range(6)]
+        # A truncated final object, e.g. from a killed writer.
+        lines.append('{"type": "user", "uuid": "u6", "timest')
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        store = InMemorySessionStore()
+        with pytest.raises(SessionImportError) as exc_info:
+            await import_session_to_store(
+                SESSION_ID, store, directory=str(cwd), batch_size=2
+            )
+
+        error = exc_info.value
+        assert error.path == path
+        assert error.line_number == 7
+        assert isinstance(error.original_error, json.JSONDecodeError)
+        assert str(path) in str(error)
+        assert "line 7" in str(error)
+        # -- batch_size=2 would have flushed three batches before line 7 -- #
+        key: SessionKey = {"project_key": project_key, "session_id": SESSION_ID}
+        assert store.get_entries(key) == []
+
+    @pytest.mark.anyio
+    async def test_corrupt_subagent_line_leaves_the_main_transcript_out_too(
+        self, claude_dir: Path, cwd: Path, project_key: str
+    ) -> None:
+        _write_jsonl(claude_dir / f"{SESSION_ID}.jsonl", [_entry(0), _entry(1)])
+        sub_path = claude_dir / SESSION_ID / "subagents" / "agent-abc.jsonl"
+        _write_jsonl(sub_path, [_entry(10)])
+        with sub_path.open("a", encoding="utf-8") as f:
+            f.write('{"type": "user", "uuid": "u11"\n')
+
+        store = InMemorySessionStore()
+        with pytest.raises(SessionImportError) as exc_info:
+            await import_session_to_store(SESSION_ID, store, directory=str(cwd))
+
+        assert exc_info.value.path == sub_path
+        assert exc_info.value.line_number == 2
+        # -- every transcript is validated before the first append, so the valid -- #
+        # -- main transcript was not imported either -- #
+        assert (
+            store.get_entries({"project_key": project_key, "session_id": SESSION_ID})
+            == []
+        )
+
+    @pytest.mark.anyio
+    async def test_corrupt_line_error_is_catchable_as_claude_sdk_error(
+        self, claude_dir: Path, cwd: Path
+    ) -> None:
+        path = claude_dir / f"{SESSION_ID}.jsonl"
+        path.write_text("not json\n", encoding="utf-8")
+
+        store = InMemorySessionStore()
+        with pytest.raises(ClaudeSDKError):
+            await import_session_to_store(SESSION_ID, store, directory=str(cwd))
 
 
 # ---------------------------------------------------------------------------

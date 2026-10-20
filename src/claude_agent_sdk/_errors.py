@@ -1,5 +1,6 @@
 """Error types for Claude SDK."""
 
+from pathlib import Path
 from typing import Any
 
 
@@ -132,3 +133,28 @@ class MessageParseError(ClaudeSDKError):
     def __init__(self, message: str, data: dict[str, Any] | None = None):
         self.data = data
         super().__init__(message)
+
+
+class SessionImportError(ClaudeSDKError):
+    """Raised when a session transcript cannot be imported into a ``SessionStore``.
+
+    Names the transcript file and the 1-based line number of the unparseable
+    line. :func:`import_session_to_store` validates every transcript before it
+    appends anything, so a raised ``SessionImportError`` means nothing was
+    imported; fix or truncate the file and call it again.
+
+    Attributes:
+        path: Transcript file that failed to parse.
+        line_number: 1-based line number within the file.
+        original_error: The underlying JSON parse error.
+    """
+
+    def __init__(
+        self, path: Path | str, line_number: int, original_error: Exception
+    ) -> None:
+        self.path = Path(path)
+        self.line_number = line_number
+        self.original_error = original_error
+        super().__init__(
+            f"Corrupt transcript line {line_number} in {self.path}: {original_error}"
+        )

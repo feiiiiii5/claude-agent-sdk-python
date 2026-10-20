@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
+from .._errors import SessionImportError
 from ..types import SessionKey, SessionStore, SessionStoreEntry
 from .sessions import (
     _read_agent_metadata_sidecar,
@@ -65,6 +66,10 @@ async def import_session_to_store(
     Raises:
         ValueError: If ``session_id`` is not a valid UUID.
         FileNotFoundError: If the session JSONL cannot be found on disk.
+        SessionImportError: If any transcript line is not valid JSON. Every
+            transcript is validated before the first ``store.append()``, so a
+            corrupt line leaves the store untouched (fix or truncate the file
+            and retry — re-import is duplicate-safe).
     """
     if not _validate_uuid(session_id):
         raise ValueError(f"Invalid session_id: {session_id}")
@@ -82,26 +87,34 @@ async def import_session_to_store(
         batch_size = MAX_PENDING_ENTRIES
 
     main_key: SessionKey = {"project_key": project_key, "session_id": session_id}
-    await _append_jsonl_file_in_batches(resolved, main_key, store, batch_size)
-
-    if not include_subagents:
-        return
 
     # Subagent transcripts live at <projectDir>/<sessionId>/subagents/**.
     session_dir = resolved.with_suffix("")
-    subagents_dir = session_dir / "subagents"
-    for file_path in _collect_jsonl_files(subagents_dir):
-        # subpath is the path relative to session_dir, '/'-joined, sans .jsonl —
-        # e.g. subagents/agent-abc or subagents/workflows/run-1/agent-def.
-        # Matches file_path_to_session_key() so list_subkeys() and
-        # get_subagent_messages_from_store() round-trip.
-        rel_parts = list(file_path.relative_to(session_dir).parts)
-        rel_parts[-1] = rel_parts[-1][: -len(".jsonl")]
-        sub_key: SessionKey = {
-            "project_key": project_key,
-            "session_id": session_id,
-            "subpath": "/".join(rel_parts),
-        }
+    subagent_files: list[tuple[Path, SessionKey]] = []
+    if include_subagents:
+        for file_path in _collect_jsonl_files(session_dir / "subagents"):
+            # subpath is the path relative to session_dir, '/'-joined, sans .jsonl —
+            # e.g. subagents/agent-abc or subagents/workflows/run-1/agent-def.
+            # Matches file_path_to_session_key() so list_subkeys() and
+            # get_subagent_messages_from_store() round-trip.
+            rel_parts = list(file_path.relative_to(session_dir).parts)
+            rel_parts[-1] = rel_parts[-1][: -len(".jsonl")]
+            sub_key: SessionKey = {
+                "project_key": project_key,
+                "session_id": session_id,
+                "subpath": "/".join(rel_parts),
+            }
+            subagent_files.append((file_path, sub_key))
+
+    # Parse every transcript before writing to the store: an unparseable line in
+    # any of them (the normal state of a transcript whose writer was killed
+    # mid-append) must not leave a partial import behind.
+    for file_path, _ in [(resolved, main_key), *subagent_files]:
+        _validate_jsonl_file(file_path)
+
+    await _append_jsonl_file_in_batches(resolved, main_key, store, batch_size)
+
+    for file_path, sub_key in subagent_files:
         await _append_jsonl_file_in_batches(file_path, sub_key, store, batch_size)
 
         # The on-disk .jsonl does NOT contain agent_metadata entries — those
@@ -127,15 +140,16 @@ async def _append_jsonl_file_in_batches(
     """Stream-read a JSONL file line-by-line, parsing each line and flushing to
     ``store.append()`` in batches of ``batch_size`` entries (or
     ``MAX_PENDING_BYTES`` of line text, whichever comes first). Skips blank
-    lines."""
+    lines. Parsing happens before the line joins its batch, so an unparseable
+    line raises :class:`SessionImportError` without being written."""
     batch: list[SessionStoreEntry] = []
     nbytes = 0
     with file_path.open(encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.rstrip("\n")
             if not line:
                 continue
-            batch.append(json.loads(line))
+            batch.append(_parse_jsonl_line(file_path, line_number, line))
             nbytes += len(line)
             if len(batch) >= batch_size or nbytes >= MAX_PENDING_BYTES:
                 await store.append(key, batch)
@@ -143,6 +157,30 @@ async def _append_jsonl_file_in_batches(
                 nbytes = 0
     if batch:
         await store.append(key, batch)
+
+
+def _validate_jsonl_file(file_path: Path) -> None:
+    """Parse every line of `file_path` and import nothing from it.
+
+    Raises :class:`SessionImportError` naming the file and the 1-based line
+    number when any line is not valid JSON. Used to catch a corrupt transcript
+    before the first `store.append()` so a failed import leaves nothing behind.
+    """
+    with file_path.open(encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.rstrip("\n")
+            if line:
+                _parse_jsonl_line(file_path, line_number, line)
+
+
+def _parse_jsonl_line(
+    file_path: Path, line_number: int, line: str
+) -> SessionStoreEntry:
+    """Parse one transcript line, converting JSON failures to a domain error."""
+    try:
+        return cast(SessionStoreEntry, json.loads(line))
+    except (json.JSONDecodeError, ValueError) as e:
+        raise SessionImportError(file_path, line_number, e) from e
 
 
 def _collect_jsonl_files(base_dir: Path) -> Iterator[Path]:
